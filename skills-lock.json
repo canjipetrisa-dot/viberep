@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "skills": {
+    "limitr": {
+      "source": "dev-formata-io/limitr",
+      "commit": "8a8fba8cc40850956fca705ee45e6d22459b409c",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/limitr/SKILL.md",
+      "computedHash": "e37bd924edee0b5f262510e1f5d1e15b9d541b0ec8c152859fc95cc8ed214469"
+    },
+    "limitr-network": {
+      "source": "dev-formata-io/limitr",
+      "commit": "8a8fba8cc40850956fca705ee45e6d22459b409c",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/limitr-network/SKILL.md",
+      "computedHash": "9ee104309ef683e6d941e466f9a3c21e9c8a75ff2dc8b2fda4ba7686018a5afd"
+    },
+    "limitr-py": {
+      "source": "dev-formata-io/limitr",
+      "commit": "8a8fba8cc40850956fca705ee45e6d22459b409c",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/limitr-py/SKILL.md",
+      "computedHash": "ef0f501c691868bdb0822319ab4c2ec88dbe04159da7f8181300a6e1b54268de"
+    },
+    "limitr-ts": {
+      "source": "dev-formata-io/limitr",
+      "commit": "8a8fba8cc40850956fca705ee45e6d22459b409c",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/limitr-ts/SKILL.md",
+      "computedHash": "edcbeccbcc8c5bf013cea93633f0f2e760036e2f4715691a857ecf664790b5ca"
+    },
+    "stof": {
+      "source": "dev-formata-io/limitr",
+      "commit": "8a8fba8cc40850956fca705ee45e6d22459b409c",
+      "sourceType": "github",
+      "skillPath": "plugin/skills/stof/SKILL.md",
+      "computedHash": "ff9de2142a241cbf157c8f1282155a6a3a7999e91c35d8956a64f483475a89f2"
+    }
+  }
+}

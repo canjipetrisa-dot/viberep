@@ -1,0 +1,382 @@
+---
+name: limitr-ts
+description: >
+  Use Limitr from TypeScript or JavaScript with the @formata/limitr package: create the engine, load policies and
+  customers, gate calls with allow/check, feature flags and rollouts, give or take a customer's features, reserve
+  and settle LLM calls, predict output tokens before a call, handle events, persist customer state, and connect to
+  Limitr Cloud, load the Limitr Network module (limitr.network(), see the limitr-network skill), and govern agents
+  built on the Claude Agent SDK (references/claude-agent-sdk.md) or calls made with the Claude Messages API
+  (references/claude-messages.md). Use for code that imports @formata/limitr or calls
+  Limitr.new / Limitr.cloud, and for integrating usage limits, credits, or pricing into a Node, Deno, Bun, or browser
+  app. Load the limitr skill for policy semantics and the stof skill for Stof syntax.
+---
+
+# Limitr for TypeScript
+
+`@formata/limitr` embeds the Limitr engine (the Stof spec compiled to BSTF) in a Stof WebAssembly document and
+wraps the policy's functions (at `root.policy`) as async methods. It runs in-process in Node, Deno, Bun, and browsers. No network
+calls happen in any hot path; Cloud mode syncs over a background WebSocket.
+
+This skill covers the TypeScript API. What a policy means and how a call is decided is in the **limitr** skill; read
+it before designing a policy or explaining a result.
+
+## Install
+
+```bash
+npm i @formata/limitr
+```
+
+The package depends on `@formata/stof` (0.11.6 or later). Import only
+from `@formata/limitr`. It ships this skill and the limitr skill in `node_modules/@formata/limitr/skill/`; the stof
+skill (the Stof language) ships with Stof, in `node_modules/@formata/stof/skill/stof/`. A step-by-step tutorial with
+runnable examples is in the repo's `typescript/tutorial`.
+
+## Create the engine
+
+```ts
+import { Limitr } from '@formata/limitr';
+
+const limitr = await Limitr.new(`
+policy: {
+    credits: {
+        request: { label: 'Request' }
+        ai_token: { price: { amount: 0.00002 }, overhead_cost: 0.000003 }
+    }
+    plans: {
+        free: {
+            default: true
+            entitlements: {
+                export_pdf: {}
+                api: { limit: { credit: 'request', value: 1000, resets: true, reset_inc: 1day } }
+                chat: { limit: { credit: 'ai_token', mode: 'soft', value: 50_000, resets: true } }
+            }
+        }
+    }
+}`);
+```
+
+- `Limitr.new(policy, format = 'stof', validate = true)` initializes the wasm runtime, loads the engine and the
+  policy, and throws with the validation message if the policy is invalid. `policy` can be a string (Stof, JSON,
+  YAML, TOML), an object with `format = 'json'`, or BSTF bytes with `format = 'bstf'`.
+- `new Limitr(policy, format)` is the synchronous constructor; call `await initStof()` (from `@formata/stof`) first.
+- `await limitr.valid()` returns `[ok, message]`. `await limitr.version()` is the engine version.
+- Create one engine per process (or per policy) and keep it. It holds all customer state in memory.
+
+## Customers
+
+```ts
+await limitr.ensureCustomer(userId, 'pro', 'user', 'Ada', [orgId], [authId]); // creates if missing, true if created
+await limitr.createCustomer(orgId, 'pro', 'org', 'Acme');                     // returns the customer record
+await limitr.setCustomerPlan(userId, 'team');                                 // plan change
+await limitr.setCustomerPeriod(orgId, sub.current_period_start * 1000, sub.current_period_end * 1000); // billing period (without Cloud)
+await limitr.setCustomerExpires(trialId, Date.now() + 14 * 86_400_000);       // access ends (null: never)
+await limitr.customer(userId);                                                // LimitrCustomer | undefined
+```
+
+Arguments are `(id, plan = '', type = 'user', label = 'User', refs = null, alts = null, metadata = null)`. An empty
+plan inherits from refs, then the policy's default plan. Use refs for user to team to org, and alts for other IDs
+(auth subject, Stripe customer) that should resolve to the same customer. A customer's plan, gives, rules, and shared
+caps come through refs only when the customers they lead to are loaded: without Cloud, load (or ensure) the org and
+team before the user, Ex. when restoring customers from your database; with Cloud, they're loaded with it.
+
+Note: `setCustomerPlan(id, plan, overwrite_meters = true)` resets meters by default in TypeScript; pass `false` to
+keep usage across the plan change (kept meters move to the new plan's credit). Included topup balances move to the new plan's included topups (`top_up` by
+default: raised to the new amount, never lowered), and purchased ones stay.
+
+`reset_sch: 'period'` limits, topups, and caps reset with each customer's billing period. On Limitr Cloud the
+period comes from the customer's ledger; without Cloud, call `setCustomerPeriod` when your subscription renews (no
+dates: the plan's calendar period, Ex. the 1st of the month).
+
+IDs and alt IDs can't contain a period: the customer isn't created (`createCustomer` returns undefined) and the
+engine logs an error. For an email, replace its periods with your own placeholder, or keep it in metadata.
+
+## Gate calls
+
+```ts
+if (!(await limitr.allow(userId, 'export_pdf'))) return forbidden();        // feature flag
+if (!(await limitr.allow(userId, 'api', 1))) return tooManyRequests();      // meter one request
+await limitr.allow(userId, 'storage', '250MB');                               // units in a string
+await limitr.increment(orgId, 'seats');                                       // the limit's increment
+const ok = await limitr.check(userId, 'api', 50);                             // dry run, changes nothing
+```
+
+`allow(customer, entitlement, value = 0, event = true, overhead?, force = false, detail = false)` and
+`check(customer, entitlement, value = 0, context?, overhead?, detail = false)`:
+
+- `event`: `true`, `false` (no events), or event data (an object or string). Event data is sent with the events as
+  `event_data` and is the context for the credit's `overhead()` cost function (Ex. `{ model, input, output }`).
+- `overhead`: the call's real provider cost in runes (USD by default), when you have it. It overrides the cost
+  function.
+- `force`: record usage that already happened, even past a hard limit or cap.
+- `detail`: return a `LimitrDecision` instead of a boolean: `allowed`, `reason` (a `LimitrDecisionReason`, null when
+  allowed), and where the customer stands (`used`, `limit`, `remaining`, `allowance`, `held`, `resets`, `access`,
+  `limit_source`, plus `cap` / `cap_customer` or `available` for those reasons). Tell a user or an agent why:
+
+```ts
+const d = await limitr.check(userId, 'api', 50, undefined, undefined, true);
+if (!d.allowed) return deny(d.reason === 'limit' ? `Monthly limit reached, resets ${new Date(d.resets!)}` : d.reason);
+```
+
+Reads: `value`, `remaining`, `limit`, `allowance`, `cost`, `resets`, `rate`, `acceleration`,
+`projectedExhaustion`, `remainingCredit`, `meterObject`, `limitObject`, `entitlement`, `plan`, `credit`,
+`creditExchange`. Each is `(customer, entitlement, ...)` and returns plain values or records.
+
+Exchange rates can change at runtime: `setExchangePair(name, value, currency = 'rune')` adds or replaces a pair (false,
+with nothing changed, if it doesn't reach runes), `exchangePair(name)` reads one, and `removeExchangePair(name)`
+removes one. Ex. `await limitr.setExchangePair('euro', 1.16, 'usd')` from a scheduled job.
+
+Each method call is atomic (calls go through a promise queue, one at a time), but two calls are not: another
+request can run between a `check` and the following `allow`. When concurrent requests must not overspend, use
+`reserve`. For one action with several entitlements, go gates (`check`), then holds (`reserve`), then counts
+(`allow`), and `release` the holds if a count is refused. A hold spends a governor's tokens like `allow` does
+(`settle` trues them up, `release` gives them back), so rate limits hold either way. The limitr skill's patterns
+("Stacking entitlements") and tutorial chapter 8 show it.
+
+## Feature flags and custom deals
+
+Rollouts, kill switches, and per-call rules live in the policy (an entitlement's `enabled`, see the limitr skill),
+so the app code stays the same `check`/`allow`:
+
+```ts
+if (!(await limitr.check(userId, 'ai_assistant'))) return notFound();            // rollout decided by the policy
+const show = await limitr.check(userId, 'new_checkout', 0, { country: req.geo.country }); // rule reads event data
+
+// Everything this customer can use right now, for the front end
+res.json({ features: await limitr.features(userId, { country: req.geo.country }) });
+
+// Custom deals: whether one customer has a feature, whatever the plan says
+await limitr.giveEntitlement(orgId, 'sso');                          // from the closest plan that has it
+await limitr.giveEntitlement(orgId, 'api', 'enterprise', Date.now() + 14 * 86_400_000); // that plan's limit, 14 days
+await limitr.takeEntitlement(orgId, 'exports');                      // pause one feature
+await limitr.restoreEntitlement(orgId, 'exports');
+
+// Deals for many customers: the policy's rules (policy.rules), by name
+await limitr.setCustomerRules(orgId, ['acme_2027']);
+const why = await limitr.entitlementSource(userId, 'api'); // { access: 'ref:org_1', limit: 'plan', customer: userId }
+```
+
+- `features(customer, context?)` returns entitlement names (or null for an unknown customer). It's access, not
+  capacity: a used-up metered entitlement is listed, so still `allow` usage.
+- Give/take return false for an unknown customer, and give returns false when no plan defines the entitlement.
+  Gives and takes are stored on the customer (`given`, `taken`), so persisting customers persists them. An org's
+  apply to the users on its plan.
+- `setCustomerRules(id, names)` replaces the customer's rules (an empty list clears them). On Limitr Cloud, these
+  are the customer's own rules: Cloud keeps them, and adds the ones a rule's segments and the customer's contracts
+  give.
+- Per-customer targeting (a beta list) is customer metadata: `createCustomer(id, plan, type, label, refs, alts,
+  { beta: true })` or `setCustomer`, read by the rule as `customer.metadata`.
+- Entitlements with `track: true` send `feature-checked` (`caller.id`, `entitlement`, `enabled`) on every check:
+  forward it to your analytics to measure a rollout or A/B test.
+
+## LLM calls: per-model billing
+
+The simplest setup is a credit and an entitlement per model and direction (`sonnet_input`, `sonnet_output`, each with
+its own price and `overhead_cost`). After the call, record what the provider reported:
+
+```ts
+await limitr.allow(userId, `${model}_input`, res.usage.input_tokens);
+await limitr.allow(userId, `${model}_output`, res.usage.output_tokens);
+```
+
+To gate as well, either `check` before the call and `allow(..., true, undefined, true)` (force) after it, or keep a
+separate control entitlement in your own token count that you allow (or reserve) before the call. To give customers
+one balance across models, grant an abstract `ai_credit` (an exchange pair, no price): it pays for each model at its
+own price. A cost function (below) is for metering one unit across models.
+
+## LLM calls: reserve, then settle
+
+The policy's `chat` entitlement declares `estimate_basis: 'input'` and `estimate_segment: 'model'` (see the limitr
+skill), so the event data alone sizes each prediction:
+
+```ts
+const hold = await limitr.reserve(userId, 'chat', { context: { model, input: inputTokens } });
+if (!hold) return paymentRequired();
+try {
+    const res = await callModel(model, messages);
+    await limitr.settle(userId, 'chat', hold, res.usage.input_tokens + res.usage.output_tokens,
+        { model, input: res.usage.input_tokens, output: res.usage.output_tokens });
+} catch (e) {
+    await limitr.release(userId, 'chat', hold);
+    throw e;
+}
+```
+
+- `reserve(customer, entitlement, { value?, context?, basis?, segment?, ttl?, quantile?, overhead? })` returns a hold
+  ID or null (not allowed now). Without `value`, it holds the predicted amount (`estimate`), or the standard
+  increment until something has been learned.
+- `settle(customer, entitlement, holdId, value, event?, overhead?, basis?, segment?)` records the real usage and
+  learns from it. Pass the provider's reported cost as `overhead` when you have it.
+- `release` drops a hold; `held` is the room held now. Unsettled holds expire after the policy's `hold_ttl` (10 min).
+- `estimate(customer, entitlement, { context?, quantile?, basis?, segment? })` returns `{ value, overhead, samples,
+  source, scope }` or null. `observe(customer, entitlement, value, { context?, overhead?, basis?, segment? })`
+  records a call without a hold.
+- `basis` and `segment` options override what the event data says. They are rarely needed.
+- Keep the segment field's values low-cardinality (a model name, a feature), never a user or request ID.
+
+### Predict output tokens before a call
+
+Add an entitlement with no limit next to `chat` (it is never metered, so it only learns):
+`chat_output: { estimate_basis: 'input', estimate_segment: 'model' }`. Record each call's output, then ask before
+the next one:
+
+```ts
+// after the call, next to settle
+await limitr.observe(userId, 'chat_output', res.usage.output_tokens,
+    { context: { model, input: res.usage.input_tokens } });
+
+// before a call: typical (0.5) for a quote or a progress bar, cautious (0.9) for max_tokens or a budget check
+const predicted = await limitr.estimate(userId, 'chat_output', { context: { model, input: inputTokens }, quantile: 0.5 });
+const expectedOutput = predicted?.value ?? null;   // null until something has been learned for this model
+```
+
+It learns a fixed amount per call plus an amount per input token, so a short question that gets a long answer
+predicts a long answer. Each customer's own numbers take over after 5 calls. `reserve` on `chat` already predicts
+total tokens the same way; use this when you need the output alone.
+
+## Agents and Claude calls
+
+To govern an agent built on `@anthropic-ai/claude-agent-sdk`, read `references/claude-agent-sdk.md` and copy its
+recipe: it hides the tools a customer can't use (`features` into `disallowedTools`), decides and counts each tool
+call in a `PreToolUse` hook (denying with the decision's reason), meters each model response from the message stream
+(once per response ID), and stops the run in `PostToolBatch` when the tokens run out. Plain hooks and options, so
+`query()` stays as it is.
+
+For calls made with `@anthropic-ai/sdk` (`client.messages.create` and your own tool loop), read
+`references/claude-messages.md`: it offers only the tools the customer can use, caps `max_tokens` at the tokens left
+under a hard limit, holds room for the call while it runs (`reserve`, then `settle` with the real usage), and answers
+refused tool uses with a `tool_result` carrying the reason.
+
+## Spend caps
+
+```ts
+await limitr.addCustomerCap(orgId, 500, { cap_id: 'org_monthly', shared: true, resets: true, reset_sch: 'monthly:1' });
+await limitr.addCustomerCap(userId, 15, { credit: 'euro', overage_only: true });
+await limitr.customerCap(orgId, 'org_monthly');      // LimitrCap (meter_value is spend so far)
+await limitr.resetCustomerCap(orgId, 'org_monthly');
+await limitr.removeCustomerCap(orgId, 'org_monthly');
+```
+
+Options (`LimitrCapOptions`): `cap_id`, `credit` (default `'rune'`), `exchangeable`, `ignore_grants`,
+`overage_only`, `observe_only`, `overhead_cost`, `follow_decrements`, `hard_trailing`, `shared`, `shared_with`,
+`scope`, `resets`, `reset_inc` (ms), `reset_sch`, `expires_on` (ms), `send_events`. Returns null if the cap ID
+already exists.
+
+Margins for a pipeline or session: `startMarginMeasurement(customer, capId, overage_only = true, ignore_grants =
+true, credit = 'rune')` adds two observe-only caps (charged and costs); `captureMarginMeasurement(customer, capId)`
+returns `{ charged, costs, margin, rawMargin }` and removes them. `customerMarginSnapshot(customer)` is the
+customer's margin this period.
+
+## Grants and topups
+
+`applyCustomerTopup(customer, topup)` after a purchase, `ensureCustomerIncludedTopups(customer)` for included
+topups, `remainingCredit(customer, credit)` for the balance, and `ensureCustomerPlanQuantity(customer)` to charge
+the plan's subscription entitlement once (after its trial).
+
+On Limitr Cloud, `applyCustomerTopup` asks Cloud to buy the topup: Cloud charges for it first, then the grant arrives
+with the customer. It resolves `true` once the grant is here, and `false` if the charge failed or Cloud didn't answer
+within 30 seconds (a purchase Cloud did complete still arrives with the customer's next update).
+
+## Events
+
+```ts
+limitr.addHandler('billing', async (key, value) => {
+    const event = typeof value === 'string' ? JSON.parse(value) : value;
+    if (key === 'meter-overage') await billing.charge(event.customer.id, event.entitlement, event.overage_price);
+    if (key === 'customer-set') await db.customers.put(event.id, event);
+});
+```
+
+- Handlers receive `(name, value)`, where objects arrive as JSON strings. All handlers get every event.
+  `removeHandler(name)` and `clearHandlers()` manage them.
+- Handlers are called during the engine call that emitted the event, and async handlers are not awaited: the call
+  returns without waiting for them, so don't assume a handler finished when `allow` returns.
+- A handler that throws (or rejects) is logged with `console.error` and skipped. The error never reaches the call
+  that sent the event, which has already recorded its usage, and the other handlers still run.
+- Event names and payloads are in the limitr skill (`references/events.md`). Common ones: `meter-changed`,
+  `meter-overage`, `meter-limit`, `meter-governed`, `meter-reset`, `cap-limit`, `cap-threshold-crossed`,
+  `customer-set`, `feature-checked`, and `customer-entitlement-given`/`-taken`/`-restored`. Meter events carry the call's cost (`meter.overhead_diff`) and list price (`meter.price_diff`) in
+  runes, which together give its margin.
+- In Cloud mode, `topup-purchase-failed` also arrives from Cloud, and `sdk-unsupported` when this SDK is older than
+  Cloud supports (update the package).
+
+## Persist customer state
+
+Customer records hold all state (meters, grants, caps, overrides, gives and takes). Without Cloud, save them and load them back:
+
+- Save on `customer-set` and on meter events (their `customer` carries its meters), or periodically via
+  `limitr.customers()`.
+- Load on startup with `loadCustomers(records)` (an array, or an object keyed by ID), or `setCustomer(record)` one
+  at a time. `ensureSetCustomer(record)` sets one only if it is missing.
+
+## Change the policy at runtime
+
+`setPlan(id, planStof)`, `deletePlan(id)`, `setNotifications(stof)`, `setCapabilities(stof)`, and
+`difference(otherLimitr)` (a diff of two policies). `runCapability(name, args, customerId?)` runs a capability and
+returns its result as plain data (text, a number, a list, or an object as a record), or null if the customer can't
+use it. For anything else, call the engine directly:
+`await limitr.docCall('policy.some_function', ...args)`. `limitr.doc` is the underlying `StofDoc`, for
+registering host functions the policy can call (`limitr.doc.lib('App', 'name', fn)`) or allowing HTTP from the
+policy (`limitr.doc.allowHttp(['api.example.com'])` for listed hosts, or `limitr.doc.allowHttp()` for any public host).
+A `Limitr.new` policy is sandboxed: no network, file system, or environment access unless you add it.
+
+Read-only questions about the policy can go straight to the document: `limitr.doc.get('policy.plans.pro.label')`,
+`limitr.doc.stringify('json', 'policy.plans')`, or a one-off Stof function that isn't added to the policy,
+`await limitr.doc.callSource('fn f(x: str) -> list { ... }', [arg], 'policy')` (`self` is the policy). Change
+customers, meters, and plans through the Limitr methods, which keep meters consistent and send events.
+
+Every policy call has a time limit, 5 seconds by default, so a policy function stuck in a loop fails instead of
+blocking every later call. Change it with `limitr.setMaxExecutionTime(ms | null)`.
+Errors the engine logs (Ex. a failing cost function) go to `console.error`.
+
+## Limitr Cloud
+
+```ts
+const limitr = await Limitr.cloud({ token: process.env.LIMITR_TOKEN! });
+```
+
+- Cloud sends the active policy (and updates to it), and customers on demand. Everything else is the same API.
+- Options: `policy` (an ID, or `'active'`), `connectTimeout` (5s), `denyUnconnected` (default true: deny `allow`
+  while disconnected, to protect shared state), `validate`, `httpHosts`, `maxExecutionTime` (ms, default 5000),
+  `batchMs` (how long usage and customer updates are collected before they're sent together; 250 by default, `0`
+  sends each right away).
+- A Cloud policy can reach any public host over HTTP by default (`httpHosts: true`), so capabilities can call the
+  services they list. `localhost` and private network addresses are refused unless you list them. Pass a list to
+  allow only those hosts (Ex. `['api.limitr.dev', 'api.example.com']`), or `false` for none.
+- A customer not loaded locally is fetched from Cloud on first use (`addCloudCustomer`), with the customers its refs
+  lead to (its team and org, any depth), and `ensureCustomer` creates it only when Cloud doesn't have it (loading its
+  refs from Cloud first, so a new user is on its org's plan).
+- Call `await limitr.close()` on shutdown to flush pending updates.
+- **Never put a key in a browser or an app on users' devices.** The app's server mints a client token for the
+  signed-in customer and the client connects with it: `POST https://api.limitr.dev/v1/server/client-tokens` with
+  `Authorization: Bearer <key>` and `{ customer, ttl_seconds? }` returns `{ token, customer, expires }` (an hour
+  by default, 60 to 86,400 seconds; the customer must exist, or 404). In the client, `Limitr.cloud({ token })`, then
+  `addCloudCustomer(id)`. A token reaches only that customer and the customers its refs lead to, meters usage but
+  can't create or change customers, reads its own invoices only, and stops when it expires or its key is deleted.
+  Mint a new one before `expires`. Show customers their usage this way (`remaining`, `limit`, `features`): it
+  stays current as Cloud changes the customer. To re-render when it does, handle `internal-customer-updated`: the
+  engine sends it (the customer, as JSON) each time Cloud sends a customer, after it has the new copy. Read what the
+  page shows from a `setTimeout` (after the engine's call) and re-render when it changed.
+
+## Limitr Network
+
+`await limitr.network({ secretKey, name, channels })` loads the Network module and gives the policy an identity: sell
+routes to agents with `network.handle(request, work)`, or buy them with `network.connect(url, plan, spend, expires)`
+and run them as capabilities. On a `Limitr.cloud()` engine whose workspace has Limitr Network, Limitr Cloud is its
+operator (state, identity, discovery) over the engine's connection, with nothing to set up (`cloud: false` opts out). `limitr.module(name, bytes, setup?)` is the general way to add a sealed module. The
+**limitr-network** skill covers it all.
+
+## Common mistakes
+
+1. **Not awaiting.** Every method is async; `if (limitr.allow(...))` is always true.
+2. **Re-creating the engine per request.** All state lives in the instance. Create it once.
+3. **`check` then `allow` under concurrency.** Not atomic across requests; use `reserve` / `settle`.
+4. **Reading event payloads without parsing.** Object payloads are JSON strings.
+5. **Missing the basis.** On an entitlement with `estimate_basis`, every `reserve` and `settle` needs that field
+   in its event data. Without it, the call is metered but not learned from, and the engine logs it.
+6. **High-cardinality `segment` values.** Each one keeps an estimate in memory forever.
+7. **Losing state on restart** without Cloud. Persist customers from events and load them on boot.
+8. **Forgetting `overhead` when the provider reports cost.** Without it, the credit's cost function or fixed
+   `overhead_cost` prices the call.
+9. **Hard-coding rollouts in the app.** Put the rule in the entitlement's `enabled` so every server, the front end
+   (via `features`), and Cloud agree.
+10. **Treating `features` as permission to use.** It lists access; metered usage still goes through `allow`.

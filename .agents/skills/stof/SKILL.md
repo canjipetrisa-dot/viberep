@@ -1,0 +1,691 @@
+---
+name: stof
+description: >
+  Write, read, debug, and embed Stof (.stof) documents. Stof is a data runtime: a superset of JSON where
+  documents carry their own functions, types, units, schemas, and tests, and run sandboxed anywhere
+  (Rust, WebAssembly/TypeScript, Python). Use for any .stof file, Stof syntax or error question,
+  converting JSON/YAML/TOML to Stof, self-validating configs (#[schema]), prototype types (#[type]),
+  #[main]/#[test]/#[run] functions, the `stof` CLI, or embedding Stof with StofDoc (JS), Doc (Python),
+  or Graph/Runtime (Rust). Also use when code shows `self.`, `#[type]`, `new X {}`, `schemafy`,
+  `Lib::func`, `funcs(attributes = ...)`, or `stof test`.
+---
+
+# Stof
+
+Stof is a **data runtime**: a document is data plus the logic that belongs with it. Every JSON document is
+already valid Stof. On top of JSON, Stof adds functions, types, units (`5km`, `2GB`, `30s`), semantic versions,
+attributes, prototypes, schemas, imports, and tests. Documents run sandboxed: they can only see themselves and the
+libraries the host gives them.
+
+This file is the language guide. Each standard library is documented in `references/libs/<Lib>.md`; read the one
+you need before using functions not shown here (list at the end).
+
+## Mental model
+
+- A document is a **graph of objects**. Each object holds **fields** (named values) and **functions**.
+- The top-level body of a file is the **main root** object. `root Name { ... }` declares another root. Imports
+  can create roots (`import './x.stof' as X;`).
+- Inside a function, `self` is the object the function lives on, `super` is its parent, and `root` is the
+  root above it.
+- Functions are values on objects (`self.fn_name`), not globals. Call them with a path: `self.total()`.
+- Fields are created by declaring them in the document or by assigning (`self.count = 1`). Variables (`let`,
+  `const`) live only inside a function.
+
+## Rules that trip people up
+
+Read these before writing Stof. Each one is a real mistake that produces wrong results or an error.
+
+1. **Paths start at a root, a variable, `self`, `super`, or `root`.** Inside a function, `config.port` means
+   "the root named `config`". For a field, write `self.config.port`. The parser warns about bare names that
+   can't resolve: `warning: unknown name 'config' ... (use self.config for a field)`.
+2. **Functions only see their own parameters and locals.** A named function can't read its caller's variables;
+   pass values as arguments. Arrow functions (`(x: int): int => x + offset`) do see the variables of the
+   function they're written in, as they were where each arrow was made (arrows made in a loop each keep their
+   own iteration's), before any variable of the function that calls them.
+3. **Arithmetic with null is an error.** `null * 3` throws `cannot multiply null: the left value is null or
+   missing (use ?? to give a default)`. Give defaults with `??`: `(self.rate ?? 0) * 3`. Initialize
+   accumulators: `let total = 0;`. Comparisons with null don't throw (`null < 10` is `true`), so check for null first.
+4. **`{ ... }` inside an expression is a map or a set, not an object.** `{ b: 2 }` is a map whose key is the
+   value of the variable `b`. Create objects with `new`: `new { a: 1, nested: new { b: 2 } }`. Inside
+   `new { ... }` and in the document body, `{ ... }` is an object.
+5. **`return x;` needs the semicolon.** The last expression of a block without a `;` is its value:
+   `fn area() -> float { self.w * self.h }`.
+6. **Number methods return a new value.** `x.round(2)` doesn't change `x`; write `x = x.round(2)`.
+7. **Constructors run only with `new`.** An object declared in the document with a type (`Rect unit: {...}`)
+   gets the type's fields and functions, but its `#[constructor]` doesn't run.
+8. **Lists, maps, sets, and objects are shared on assignment.** `let a = l;` aliases `l`; use `copy(l)` for
+   an independent copy.
+9. **`async { expr }` with a single expression is an async set literal.** Use a statement:
+   `async { return 1 + 1; }`.
+10. **Template strings are always `str`.** `` `${a}${b}` `` concatenates text even for numbers; null prints
+    `null`. `\$` escapes a dollar sign.
+11. **Catch values are error codes.** `catch (e: str)` receives `'AssignConst'`, `FuncDne("Num.split")`, or the
+    value passed to `throw(...)`. Match on the code; for the human-readable message (to log or show), name a
+    second variable: `catch (e, message) { err(message); }`.
+12. **Arguments are cast to the parameter type.** `fn f(v: int)` called with `'5'` receives `5`; an impossible
+    cast throws (`CastVal(...)`).
+13. **`int / int` is integer division.** `7 / 2 == 3`. Use a float operand (`7 / 2.0`, `(n as float) / 2`) for
+    a fractional result. Wrap casts in parentheses inside larger expressions: `(n as float) / 2`, not
+    `n as float / 2` (a parse error).
+14. **Tests run concurrently on one shared document.** Processes switch at every loop iteration and Stof function call
+    (and `await`/`sleep`); code between those points runs without interruption. So tests that change the same
+    fields (`self.api.timeout = 2min` in one, `self.api.replicas = 0` in another) interleave and break each other.
+    Give each test its own data (`new { ... }`, or fields only that test uses) and treat shared fields as
+    read-only. Sharing is intended for tests that coordinate on purpose.
+15. **Objects are never garbage collected.** `new { ... }` adds an object to the document (a child of `self`, or of
+    the `on` parent) until something drops it; an unreferenced one is still in binary (BSTF) exports of its parent.
+    Values (numbers, strings, lists, maps, sets, tuples) are freed automatically. For a temporary object, declare it
+    with `using` and it is dropped when its block or function ends, on every exit (return, break, error):
+    `using event = new { id, amount };`, or inline: `self.handle(using new { id })`. Use a map instead when you
+    don't need an object. For many temporaries, put
+    them `on` one scratch object and drop that: `{ using scratch = new {}; ... new { .. } on scratch ... }`.
+    Don't return a `using` object (it is dropped on return). `stof test --leaks` fails tests that leave objects behind.
+
+**Answers to common questions:**
+- A missing field reads as null (`self.nope` is null, no error); calling a missing function throws (`FuncDne`)
+  unless you use `?.`.
+- `{ ... }` inside a list in the document body is an object (`items: [{ qty: 2 }]`); JSON arrays of objects
+  parse into lists of objects (`o.users[0].name`).
+- `int` and `float` compare by value (`85.0 == 85`); `str(2.0)` is `'2'`; casts with `as` work between numbers,
+  strings, and units (`'3.5' as float`, `42 as str`, `512MiB as GiB`).
+- Typed locals: `let total: float = 0;`. `const` stops reassignment, not mutation (`const l = []; l.push_back(1);`
+  is fine).
+- Destructuring: `const { name, age: years, role = 'member', address: { city } } = user;` takes fields of an object
+  (or string keys of a map); `const [first, _, third] = list;` and `const (key, value) = pair;` take items of a list
+  or tuple by position (`_` skips one). A missing field or item is null, or its default; destructuring anything else
+  (null included) throws. `let` declares them mutable.
+- `new { ... }` inside a function creates a child of `self` that lives until dropped: declare temporaries with
+  `using` (see 15), or `drop(o)` them.
+- `obj.fields()` is a list of `(name, value)` tuples (no functions).
+- A function value keeps its own `self`: `handler(x)` runs with `self` = the object the handler is defined on.
+- `pln(a, b)` prints its arguments concatenated with no separator.
+
+## Fields and values
+
+```stof
+// JSON works as-is (quotes, commas, and semicolons are all optional in Stof)
+"name": "Stof"
+version: 1.2.0                 // ver (semantic version)
+str label: 'hi'                // typed field: the value is cast to the type
+const str fixed: 'locked'      // const: assigning it throws 'AssignConst'
+list! tags: []                 // `!` = not null
+cm height: 6ft + 2in           // units convert: 187.96cm
+MiB memory: 2GB
+ms ttl: 5min                   // 300000ms
+server: {                      // nested object
+    port: 8080
+    address: 'localhost'
+    fn url() -> str { `https://${self.address}:${self.port}` }
+}
+#[readonly] ro: 42             // attributes annotate fields and functions
+#[private] secret: 'x'         // only this object's functions can read it (still exported)
+#[no-export] cache: {}         // left out of JSON and other exports
+root Settings { theme: 'dark' }
+```
+
+**Types:** `null`, `bool`, `int`, `float`, `str`, `ver`, `blob`, `list`, `map`, `set`, tuples (`(int, str)`),
+`obj`, `fn`, function signatures (`fn(str, int) -> str`), `data`, `Promise<T>`, `unknown`, unions (`int | str`),
+units, and custom types (`Rect`, `Geometry.Point`). `T!` is not null anywhere a type goes: `(int!, str)`,
+`int! | str!`, `(int | str)!`, `fn(str!) -> str`. `typeof v` gives the base type (`'obj'`, `'float'`, `'fn'`); `typename v` gives the specific one
+(`'Rect'`, `'cm'`, `'fn(int) -> int'`).
+
+**Units:** length `km hm dcm m dm cm mm um nm mi yd ft in`; time `day hr min s ms us ns`; temperature `K C F`;
+mass `Gt Mt t kg g mg ug ng pg Ton lb oz`; data `bit byte KB MB GB TB PB … KiB MiB GiB TiB …`; angles
+`rad deg`. Literals carry units (`5km`), math converts (`1km + 500m == 1.5km`, in the larger unit), `as` converts
+(`1km as m`), and `v.to_units('GB')` converts by name. A plain number has no units, so comparing one with a unit
+value compares bare numbers: `Time::now() + 1hr` is in hours, so give a time from JSON its units first
+(`const at: ms = record.expires;`) before comparing.
+
+**Literals:** `'single'`, `"double"`, `` `template ${expr}` ``, `r#"raw"#`, `[list]`, `{'map': 1}`, `{1, 2}`
+(set), `(1, 'two')` (tuple), `1_000`, `0xFF`, `1e3`, `Infinity`, `-Infinity`, `NaN`, `1.2.3` (version).
+
+## Functions
+
+```stof
+fn add(a: float, b: float = 1) -> float { a + b }                 // default parameter
+fn greet(name: str = 'world') -> str { return `Hello, ${name}!`; }
+fn maybe(id: str, limit?: int) -> int { limit ?? 10 }            // optional parameter (null when omitted)
+fn fib(n: int) -> int { if (n <= 1) return n; this(n - 1) + this(n - 2) }   // `this` = current function
+```
+
+```stof
+self.add(1, 2)              // 3
+self.add(b = 5, a = 1)      // named arguments
+const double = (x: int): int => x * 2;    // arrow function (sees the variables where it's made, even when passed on)
+const f = self.add;         // functions are values
+f(2, 3); f.call(2, 3);
+```
+
+**Function types:** `fn` takes any function. `fn(str) -> str` takes only a function that can be called with a
+`str` and returns a `str`, checked when the value is passed, assigned, or cast:
+
+```stof
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+self.apply((x: int): int => x * 2, 4)   // 8
+self.apply(self.add, 4)                 // fits: a float parameter takes an int, and b has a default
+fn(str) -> str handler: (s: str): str => s.upper()   // a typed field
+let each: fn(str) = (s: str) => pln(s); // no return type: any return
+```
+
+The check is for compatible functions, not identical ones: extra parameters need defaults (or `?`), a parameter
+can be wider than the signature's (`unknown`, a union, `float` for `int`, a prototype the signature's type extends),
+the return type can be narrower, and an async function fits by what it returns (no `Promise<..>`). An arrow with
+no return type returns `void`, so give it one (`(x: int): int => ..`). The return type takes the rest of the type
+(`fn(int) -> int | null` returns an int or null); parentheses group: `(fn(str) -> str) | int` is a function or an int. `typeof` is still `'fn'`; `typename` gives the signature. Library functions aren't values; wrap one in an arrow to pass it.
+
+**Library calls:** name a library with `::`, always: `Num::abs(-3)`, `Http::fetch(url)`, `Obj::fields(o)`,
+`Time::now()`, `App::notify(msg)` (a host's library). Don't write `Num.abs(-3)`: a `.` is a path, so it looks
+for a field or object named `Num` first and only falls back to the library (and changes meaning if the document
+ever has one). `(-3).abs()` calls the library as a method through the value's type; `Lib?::func()` returns null
+when the library or function doesn't exist (Ex. an optional host library). Standard library functions (`pln`,
+`assert_eq`, `parse`, `copy`, `seal`, ...) are called bare.
+
+**Null-safe access:** `self.a?.b`, `self.obj?.func()`, `?self.maybe_missing()` return null instead of throwing.
+`a ?? b` gives `b` only when `a` is null (`false ?? 'x'` is `false`).
+
+## Control flow and errors
+
+```stof
+let total = 0;
+for (const x in [1, 2, 3]) total += x * index;      // `index` is the loop position
+for (let i in 3) total += i;                        // 0, 1, 2
+for (const pair in self.server.fields()) pln(pair[0], pair[1]);
+for (const (key, value) in map) pln(key, value);    // destructure each item (also `{ name } in users`)
+for (let v in &list) v *= 10;                       // `&` iterates by reference (modifies the list)
+while (cond) { if (done) break; continue; }
+const kind = switch (i) { case 4: 'four' default: 'other' };
+const sign = i > 0 ? '+' : '-';
+^outer for (const a in 3) { for (const b in 3) { if (a * b == 2) break ^outer; } }   // labeled loops
+
+try { throw('bad input'); }
+catch (e: str) { pln(e); }          // typed catch; `catch { }` and `catch (e) { }` work too
+try nanoid(0); catch (e, message) { err(message); } // e: 'FuncArgs', message: 'nanoid length must be ...'
+try { throw(new { code: 42 }); } catch (e: obj) { pln(e.code); }
+```
+
+**References:** `let first = &l[0]; first = 0;` writes into the list; `swap(&a, &b)` swaps variables.
+
+## Objects, types, and prototypes
+
+```stof
+#[type]
+Shape: {
+    str name: 'shape'
+    fn area() -> float { 0 }
+    fn describe() -> str { `${self.name}: ${self.area()}` }
+    #[constructor]
+    fn created() { self.made = true; }       // runs on `new`
+}
+
+#[type]
+#[extends('Shape')]
+Rect: {
+    str name: 'rect'
+    float w: 1
+    float h: 1
+    fn area() -> float { self.w * self.h }
+    #[static]
+    fn square(side: float) -> Rect { new Rect { w: side, h: side } }
+}
+
+Rect unit: { w: 2, h: 3 }          // typed object in the document (no constructor call)
+shapes: {}
+```
+
+```stof
+self.unit.area()                    // 6, Rect's function
+self.unit.describe()                // 'rect: 6', inherited from Shape
+self.unit.instance_of('Shape')      // true
+self.unit.area<Shape>()             // 0, call the Shape version explicitly
+// in an override, call the version it replaces the same way: fn area() -> float { self.area<Shape>() + 1 }
+<Rect>.square(3)                    // static call on a type
+const r = new Rect { w: 4, h: 5 } on self.shapes;   // `on` sets the parent (default: self)
+new Geometry.Point { x: 1 }        // types nested in objects or imports: qualified name
+drop(r); r.exists();                // false: objects live until dropped
+using tmp = new { a: 1 };           // dropped automatically when this block or function ends
+
+const o = new { a: 1 };
+o.c = 3;                            // assignment creates fields
+o.insert('d.e', 4);                 // creates intermediate objects
+o.contains('a'); o.fields(); o.parent(); o.id();
+```
+
+## Schemas
+
+A type's `#[schema(...)]` attributes validate (and can transform) another object's fields.
+
+```stof
+#[type]
+Server: {
+    #[schema((target_val: int): bool => target_val > 0 && target_val < 65536)]
+    int port: 8080
+    #[schema((target_val: str): bool => target_val.len() > 0)]
+    str host: 'localhost'
+    #[schema_optional]
+    str note: null
+}
+config: { port: 70000, host: 'example.com' }
+```
+
+`<Server>.schemafy(self.config)` returns `false` (port out of range) and leaves `self.config` unchanged; after
+`self.config.port = 443` it returns `true`. With `remove_invalid = true` it deletes failing fields instead (and
+returns `true`); `remove_undefined = true` deletes fields the type doesn't declare. A missing field is validated
+as null: `#[schema_optional]` skips validation for null or missing values; otherwise make required fields reject
+null explicitly (`target_val != null && ...`), since comparisons with null don't throw (`null < 10` is `true`) and
+a method call on null (`target_val.len()`) throws out of `schemafy`. A rule with one parameter gets the value being
+checked, whatever it's named; with more, they're matched by name: `target_val` (the value), `target` (the object),
+`field` (the field's name), and `schema_val` (the type's default). See `references/libs/Obj.md` (`schemafy`).
+
+## Attributes and running functions
+
+- `#[main]`: run by `stof run` and the host `run()`. `stof run -a <attr>` (and `doc.run('attr')`) runs
+  functions with another attribute instead.
+- `#[test]`, `#[test(expected)]`, `#[errors]` (the test passes only if it throws): run by `stof test`.
+- `#[run]` steps (functions or fields): `obj.run()` runs them in the order they're written. A type's steps run
+  on each instance, first; an instance step with the same name replaces the type's (once, in its place), and
+  `#[run] step: null` removes one. `#[run(-1)]`/`#[run(1)]` run before/after the unnumbered steps.
+  `obj.run(steps = ['a', 'b'])` runs just those; `prototype = 'none'` skips the type's steps. An async step is
+  awaited before the next one starts.
+- `#[async]` or `async fn`: calling it returns a `Promise<T>`; `await` it.
+- Custom attributes are data: `#[on-save] fn audit(doc: obj) {...}` and
+  `for (const handler in funcs(attributes = 'on-save')) handler(self);` dispatch events (in the order they're
+  written).
+- `#[run({'args': [5]})]`: pass arguments to a run step.
+- `#[init]`: runs once after the document is parsed (setup).
+- `#[constructor]` / `#[dropped]` (in a type): run on `new` and on `drop(instance)`.
+- On fields: `#[readonly]`, `#[private]` (only the object's own functions can read it; still exported),
+  `#[no-export]` (left out of `stringify`), `#[schema(...)]`, `#[attr]`/`#[text]`/`#[tag]` (html and xml, see
+  Imports and formats), plus anything custom (read with `self.attributes('field')`).
+- Attributes can change at runtime: `self.set_attribute('on-save', null, 'audit')` /
+  `self.remove_attribute('readonly', 'total')` (the object itself with no path, or the field, function, or object at
+  the path; a null value is a bare `#[name]`), and `func.set_attribute('main')` / `func.remove_attribute('main')`.
+  They take effect at once (`funcs(attributes = ..)`, `run`, readonly, export). On a sealed object attributes never
+  change (an error), even when its fields may. `#[type]` and `#[init]` act at parse time, so setting them later
+  doesn't make a type or run anything.
+- `#[type_ignore]` on a type's field keeps it on the type only (not copied into instances; read it as
+  `<Type>.FIELD`). Use it with `const` for shared constants, so instances don't each carry a copy.
+
+## Imports and formats
+
+```stof
+import './lib/geo.stof' as Geo;           // relative to the importing file; `as` makes a root
+import json './data.json' as self.data;   // explicit format, into a field of this object
+import './config.yaml';                    // the file extension picks the format; into the main root
+```
+
+Formats: `stof`, `json`, `yaml`, `toml`, `urlencoded`, `text`, `md`, `html` and `xml` (xml import is in the CLI,
+Python, and JavaScript; the `xml` feature in Rust), `bstf` (binary Stof: the whole document including functions),
+and with features `pdf`, `docx`, and image formats. `@pkg/name` imports a package from `stof/pkg/name` under the
+working directory.
+
+```stof
+stringify('json', o)                 // export an object (functions and #[no-export] fields are skipped)
+const back = new {}; parse('{"x": [1, 2]}', back, 'json');   // import into an object
+const bin = blobify('bstf', o);      // binary, with functions; parse(bin, target, 'bstf') restores it
+parse('fn hi() -> str { "hi" }', self);   // documents can add code to themselves
+stringify('stof', o)                 // the object as readable Stof (parse it back with 'stof')
+```
+
+`stringify('stof', o)` writes Stof a person or a model can read: objects with their types, attributes, and doc
+comments, and values as literals (`1GB`, `set(..)`, `map((k, v))`). Comments and formatting aren't kept, and
+neither are object IDs. Functions are written as their source only when the host keeps it (`doc.keepSource()` in JS,
+`doc.keep_source()` in Python, `graph.keep_source(true)` in Rust, before parsing; off by default to save memory).
+Otherwise, and for functions loaded from BSTF, a function is written as a `data@v1` block.
+`stringify('stof:graph', o)` is the exact form (IDs, references, compiled functions), for copying a document exactly.
+
+Infinity and NaN survive every format: JSON (which has neither) writes the strings `"Infinity"`, `"-Infinity"`, and
+`"NaN"` and reads exactly those back as numbers; YAML uses `.inf`/`.nan`, TOML `inf`/`nan`; Stof and BSTF are exact.
+Printed, they're `Infinity`, `-Infinity`, and `NaN`.
+
+### HTML and XML
+
+`stringify('html', obj)` and `stringify('xml', obj)` write objects as elements. An element's name is
+`#[tag('name')]` on its field, the object, or its type, and otherwise the field's name. Its fields, in order:
+
+```stof
+#[type]
+#[tag('ui-metric')]
+Metric: {
+    #[attr] str label: '';                    // an attribute
+    #[attr] float | fn value: 0;              // a field holding a function is called for its value
+    #[attr('data-size')] fn size() -> str { self.label.len() > 10 ? 'wide' : 'narrow' }
+}
+
+#[tag('section')]
+dashboard: {
+    #[tag('h2')] title: 'Revenue';            // a value: <h2>Revenue</h2>
+    Metric mrr: { label: 'MRR', value: 1250 } // an object: a child element
+    #[text] fn footer() -> str { 'Updated today' }   // text inside the element (escaped)
+    #[no-export] cache: {}                    // skipped
+}
+```
+
+`stringify('html', self.dashboard)` is
+`<section><h2>Revenue</h2><ui-metric label="MRR" value="1250" data-size="narrow"></ui-metric>Updated today</section>`.
+
+- **Computed values:** `#[attr]` and `#[text]` functions (including the type's) and fields holding functions are
+  called by `stringify`/`blobify` before writing, and async ones are awaited. A `#[text]` function can return
+  objects (or a list of them), which are written as elements: build part of the tree in code.
+- A list is one element per item. Lists, maps, and objects in attributes are JSON. Null values aren't written.
+  Functions without `#[attr]` or `#[text]` aren't written.
+- **HTML is safe to put in a page:** text and attributes are escaped; `script`, `style`, `iframe`, `object`, `embed`,
+  `link`, `meta`, `template` (and their content) are never written; `on*` attributes are dropped, URLs must be
+  relative or http, https, mailto, tel (or a data: image), and `style`/`action`/`formaction` need the host's OK. Only standard HTML elements and custom elements (with a `-`) are written, or exactly the host's list
+  (`allow_html_tags`, which documents can't change). A `true` attribute is written bare, `false` is left out. An
+  html export of an object with no tag is a fragment (its content only).
+- **XML** starts with a declaration, writes booleans as `"true"`/`"false"`, and fails on names that aren't valid XML.
+  `parse(src, obj, 'xml')` reverses it: attributes are `#[attr]` string fields, an element with
+  only text is a string field, repeated elements are a list, and other text is a `#[text]` field named `text`.
+  Values stay strings. The root element's content goes into `obj` (which gets `#[tag]` when the names differ).
+
+## Async
+
+```stof
+async fn slow(x: int) -> int { sleep(5ms); x * 2 }
+
+const b = self.slow(5);                       // Promise<int>
+const a = async { return 1 + 1; };            // async block
+await a;                                      // 2
+await [b, self.slow(1)];                      // [10, 2]: awaiting a list awaits each
+await 'plain';                                // non-promises pass through
+```
+
+## Testing and the CLI
+
+```stof
+#[test]
+fn totals() {
+    assert_eq(self.add(1, 2), 3);
+    assert(self.unit.instance_of('Shape'));
+    assert_null(self.nope?.deeper);
+    assert_eq(self.add(2, 2), 4, 'add after reset');   // optional message: "add after reset: '5' does not equal '4'"
+}
+
+#[test(55)]
+fn expected_value() -> int { self.fib(10) }
+
+#[test]
+#[errors]
+fn must_fail() { throw('expected'); }
+```
+
+```bash
+stof test file.stof            # run #[test] functions (exit code 1 on failure)
+stof test --leaks file.stof    # one at a time, also failing tests that leave objects behind
+stof test ./dir                # a package directory
+stof run file.stof             # run #[main] functions
+stof run file.stof -a nightly  # run #[nightly] functions instead
+stof pkg ./dir                 # build a .pkg from a directory with pkg.stof
+```
+
+Errors print the message, the failing line with a caret, and the Stof call stack:
+
+```text
+error: cannot multiply null: the left value is null or missing (use ?? to give a default)
+  --> main.stof:31:5
+    |
+ 31 |     self.rate * units
+    |     ^
+  at root.total (main.stof:31:5)
+  at root.main (main.stof:28:5)
+```
+
+Fix parse warnings (`unknown name ...`) before debugging behavior; they usually mean a missing `self.`.
+Debug with `pln(...)`, `dbg(...)`, and `callstack()`.
+
+## Embedding
+
+Hosts parse documents, call functions by path, read and write values, register host functions as libraries,
+and export. Paths in `get`/`set`/`call` are relative to the main root (`'config.port'`, `'total'`); roots and
+`<Types>` work too.
+
+**TypeScript / JavaScript** (`npm i @formata/stof`):
+
+```typescript
+import { StofDoc, stofAsync } from '@formata/stof';
+
+const doc = await StofDoc.new(`
+    rate: 2
+    fn total(units: int) -> float { units * self.rate }
+`);
+await doc.call('total', 21);                     // 42
+doc.get('rate'); doc.set('rate', 3);
+doc.lib('Host', 'now', () => Date.now());        // Stof calls Host::now()
+doc.parse({ extra: true });                      // add more (Stof source, a JS object, or bytes)
+await doc.run();                                 // #[main] functions
+doc.stringify('json'); doc.blobify('bstf'); doc.record();   // export (record = plain JS object)
+await doc.callSource('fn check(x: int) -> bool { x < self.rate }', [1]);   // run once, nothing kept
+doc.remove('rate');                              // remove by path, like drop()
+
+const quick = await stofAsync`fn hi() -> str { 'hi' }`;
+```
+
+**Python** (`pip install stof`):
+
+```python
+from pystof import Doc
+
+doc = Doc()
+doc.lib('Host', 'name', lambda first, last: first + ' ' + last)   # this doc's own; any thread can call the doc
+doc.parse("rate: 2\nfn total(units: int) -> float { units * self.rate }")
+doc.call('total', [21])        # args: a list, a single value, or none (doc.call('fn'))
+doc.get('rate'); doc.set('rate', 3)   # optional start object id as a last argument
+doc.run()
+doc.string_export('json'); doc.binary_export()   # bstf of the main root
+doc.call_source('fn check(x: int) -> bool { x < self.rate }', [1])   # run once, nothing kept
+doc.remove('rate')
+```
+
+A `Doc` is safe to share across threads: calls run one at a time (another thread's call waits its turn), and a running
+call releases the GIL, so other threads go on (Ex. a server in the same process answering the call's `Http.fetch`). A
+`doc.lib` function runs with the GIL on the calling thread and can call other documents, but not back into the one that
+called it (that raises). Type stubs ship in the package.
+
+**Rust** (`cargo add stof`):
+
+```rust
+use stof::model::Graph;
+use stof::runtime::{Runtime, Val};
+
+let mut graph = Graph::default();
+graph.parse_stof_src("rate: 2\nfn total(units: int) -> float { units * self.rate }", None, Default::default())?;
+let total = Runtime::call(&mut graph, "total", vec![Val::from(21i64)])?;   // 42
+Runtime::run(&mut graph, None, true)?;                                     // #[main]
+let json = graph.string_export("json", None)?;   // graph.stringify("html", node) also calls computed values
+Runtime::call_source(&mut graph, "fn check(x: int) -> bool { x < self.rate }", None, vec![Val::from(1i64)])?;
+graph.remove("rate", false);
+```
+
+**Sandbox:** embedded documents have no file system, environment, or network access. Hosts opt in:
+`graph.allow_system()` / `graph.allow_http()` (Rust), `doc.allow_system()` / `doc.allow_http()` (Python),
+`doc.allowHttp()` (JS: adds `Http.fetch` on the JS fetch API; there's no file system in the browser build). Without `allow_system()`, `import` statements
+and `fs::*` calls fail. The `stof` CLI allows everything.
+To allow only some hosts: `graph.allow_http_hosts(["api.example.com"])` (Rust), `doc.allow_http_hosts([...])` (Python),
+`doc.allowHttp(['api.example.com'])` (JS). Requests and redirects elsewhere fail; `"localhost:8080"` limits the port too.
+Calling it again adds hosts; `graph.disallow_http_hosts([...])` (Rust), `doc.disallow_http_hosts([...])` (Python),
+`doc.disallowHttp([...])` (JS) removes them (removing every listed host leaves none, not any host).
+`Http::fetch(url, ..., timeout = 5s, max = 10MB)`: a response larger than `max` (by default the call's memory limit)
+isn't read; the response map has `error` instead of a status.
+With no list, any public host: this machine and private networks (localhost, 10.x, 192.168.x, 169.254.x metadata,
+`*.internal`, ...) fail unless listed or allowed with `allow_private_network()` (Rust, Python) / `doc.allowPrivateNetwork()` (JS).
+A call fails with an execution timeout after 2 minutes by default: `graph.max_execution_time = Some(duration)` (Rust),
+`doc.set_max_execution_time(seconds)` (Python), `doc.setMaxExecutionTime(ms)` (JS); null/None for no limit.
+A call fails with a memory limit error when it grows memory by more than 256 MB: `graph.max_memory = Some(bytes)`
+(Rust), `doc.set_max_memory(bytes)` (Python), `doc.setMaxMemory(bytes)` (JS); null/None for no limit. Like a timeout,
+a `catch` can't keep the call going. Rust hosts count all growth only with
+`#[global_allocator] static A: stof::runtime::memory::StofAlloc = stof::runtime::memory::StofAlloc;` (the JS and
+Python builds have it); without it, only single steps that would make a value too big (`'a' * n`, `split`,
+`replace`, `join`, `parse`, ...) are refused.
+To print nothing (no parse warnings, test progress, or `pln`/`err`/`dbg` output; reports and errors still come back):
+`graph.quiet(true)` (Rust), `doc.quiet()` (Python and JS).
+The html format writes only standard and custom elements by default; to allow exactly a list (Ex. your components):
+`graph.allow_html_tags(["div", "ui-card"])` (Rust), `doc.allow_html_tags([...])` (Python), `doc.allowHtmlTags([...])`
+(JS). URL attributes are written only when relative or http, https, mailto, tel (or a data: image); `style`, `action`,
+and `formaction` only when allowed: `allow_html_attributes(["style"])` (Rust, Python), `doc.allowHtmlAttributes([...])` (JS).
+In JS, if the engine ever traps (Ex. no memory limit and it runs out), the call rejects and that document is
+`doc.crashed`: every later call throws; create a new document.
+
+**Sealing, keys, and confinement:** see "Trust" below.
+
+Host exports (`graph.stringify` in Rust, `doc.stringify` in JS, `doc.string_export` in Python) call computed
+values too, with a runtime of their own: an async host function can't finish there, so call `stringify` from Stof
+(Ex. `await doc.callSource(...)`) when a computed value needs one.
+
+**Editing Stof text in place** (Ex. an app or agent changing a document people also edit by hand):
+`StofDoc.outline(text)` / `StofDoc.edit(text, edits)` (JS), `Doc.outline(text)` / `Doc.edit(text, edits)` (Python),
+`stof::parser::edit::{outline, edit}` (Rust). The outline lists every field and function with its path (Ex.
+`['policy', 'plans', 'pro']`), and whether it's an object, and its source. Edits go by path (a list, or names
+separated by dots): `{ set: 'a.b', value: 1 }` (a JSON value), `{ set: 'a.limit', stof: '1GB' }` (Stof source),
+`{ set_fn: 'a.f', stof: 'fn f() -> int { 1 }' }`, `{ remove: 'a.b' }`, `{ rename: 'a.b', to: 'c' }`. A set adds what
+isn't there (with the objects on its path), matching how the object is written. Only what an edit names changes:
+comments, formatting, and everything else stay exactly as they were. A remove takes the attributes and the comments
+directly above. If the text or the result doesn't parse, or an edit doesn't make sense, it fails and changes nothing.
+
+Host errors from `call`/`run` include the Stof call stack. Parse with the test profile (`'test'` in JS/Python,
+`stof::model::Profile::test()` in Rust) to get statement-level line numbers in runtime errors; the default production profile
+keeps documents smaller.
+
+## Trust: seals, keys, and confinement
+
+Four tools, for four questions. Pick by what you need to know:
+
+| You want to know | Use | In Stof | On the host |
+|---|---|---|---|
+| This logic can't be changed | seal | `seal(self.rules)` | `doc.seal('rules')` |
+| It's the logic that was shipped | digest + signature | `digest(obj)`, `Key::sign(secret, 'stof/seal', digest(obj))` | `doc.seal(path, { digest })` or `{ publicKey, signature }` |
+| Code from elsewhere sees only what it's given | confined seal | `seal(tool, reads = [self.inputs], hosts = [..], libs = [..], time = 2s)` | `doc.seal(path, { reads: ['inputs'], hosts: [..], libs: [..], time: 2000 })` |
+| ...and reaches the rest only through an API you give it | gates | `seal(tool, .., calls = [self.api.request])` | `doc.seal(path, { .., calls: ['api.request'] })` |
+| Data came from who it says, unchanged | signature | `Key::verify(public, context, message, sig)` | `StofDoc.verify(..)`, `Doc.verify(..)` |
+
+**Seal** an object (path, or a type as `<Name>`) and everything under it: its functions, prototypes, attributes,
+and fields holding functions or sealed objects can't be added, removed, renamed, replaced, or moved, by document
+code or the host, until the host calls `unseal`. A refused change fails with `sealed: ...` and changes nothing.
+Fields still change (that's where state lives) unless sealed with `fields` (`seal(obj, true)`,
+`{ fields: true }`). Sealed code runs as before. Functions are found by name when called, so seal everything a call
+chain relies on. Documents can seal parts of themselves (one-way); only the host unseals. Sealing again only adds
+(frozen stays frozen, confinements stack); nothing loosens. Seals live in the running document, not in exports: a
+document sent as BSTF arrives unsealed, and the receiver seals it (checking the digest or signature first).
+
+**Digest:** `digest(obj)` / `doc.digest(path)` is a SHA-256 (hex) over the part's functions and structure (plus
+field values with `fields`). The same part has the same digest in any document, parsed or loaded, wherever it sits
+(its own name and place aren't part of it; JSON-imported data digests like the same data written in Stof).
+For a plain hash another system can check (Ex. of a message's text), `sha256(text_or_blob)` is the SHA-256 (hex) of
+those bytes.
+
+**Keys and signatures** (`Key` library; Ed25519; keys and signatures are base64 strings):
+```stof
+const secret = Key::generate();                     // keep secret; usually the host passes it in
+const public = Key::public(secret);                 // share: checks signatures, can't make them
+const sig = Key::sign(secret, 'orders/v1', order);  // order is a str or blob: the exact bytes
+Key::verify(public, 'orders/v1', order, sig);       // true only for these bytes, this context, this key
+```
+- The context (Ex. 'orders/v1') names what a signature is for; it only verifies under the same context. A seal
+  signature is a signature over a digest under `'stof/seal'`.
+- Sign text, not objects: `Key::sign(secret, ctx, stringify('json', obj))`, and send that exact text. An object
+  argument is an error ("stringify an object first").
+- Hosts have the same functions, same order: `StofDoc.generateKey()`, `StofDoc.publicKey(s)`,
+  `StofDoc.sign(secret, context, message)`, `StofDoc.verify(public, context, message, signature)` (JS);
+  `Doc.generate_key/public_key/sign/verify` (Python); `stof::model::seal::{generate_key, public_key, sign, verify}`.
+  A signature made anywhere verifies everywhere.
+- A secret key is just a string: storing it in a field means it prints and exports like any string. Pass secrets in
+  as arguments, or keep them encrypted with Age (`Age::pass_blobify(passphrase, 'bstf', self.keys)`).
+- `Key` signs, `Age` encrypts; they're separate keys. Both together: `const box = Age::blobify(reader_public,
+  'json', msg); const sig = Key::sign(secret, 'messages/v1', box);` and the reader verifies, then
+  `Age::parse(reader, box, dest, 'json')`. `Age::parse`/`Age::public` take a `Data<Age>` or the secret key string.
+
+**Confined seals** (`reads`, `hosts`, `libs`, `time`, `calls`) are for code that didn't come from you. While its
+code runs (and everything it calls):
+- It finds only itself and the objects in `reads` (paths or `<Type>`s, looked up each time it's entered; objects in
+  Stof are kept as their paths). Anything else finds nothing (null): `root.secrets.x`, `super.x`. Types not listed
+  can't be used (no `new Type {}` or casts: those read the type's defaults).
+- It changes only itself. What it reads is read-only; no new roots; it can only seal itself. A list or map it reads
+  from outside is a copy (`push_back` on it changes the copy, never the field); the same goes for any code reading
+  a frozen (`fields: true`) field.
+- Calling a function elsewhere fails (even a function value it was handed). Listed code (Ex. `<Helpers>`) can be
+  called and runs confined too.
+- It can't give a library an object outside its reach or get one back (`Obj.parent(self)`, `funcs()`,
+  `stringify('json')` of everything or of an object holding one out of reach all fail).
+- `Http.fetch` reaches only `hosts` (redirects too), and the document's own allowlist still applies.
+- It calls only the libraries in `libs` (Ex. `['Std', 'Str', 'Num', 'List', 'Map', 'Http']`), the host's own
+  libraries included (`doc.lib(...)`), so it can't use a host function the document was given (Ex. one that signs
+  with the host's key). Method calls count as their library's: `text.split('/')` is `Str`, `[1, 2].len()` is
+  `List`, `stringify`/`parse` are `Std`.
+- It runs for at most `time` (Ex. `500ms`) each time it's entered, on top of the call's own limit: wall-clock time
+  from entering, waits included (Ex. an `Http.fetch`). Running past it fails with a `sealed: ...` error that only
+  code outside the part can catch (a `try` inside it can't keep it going), its gates can't be called, and its
+  `sleep` wakes at the limit.
+- It runs only while it's called: a process its code spawns and leaves running (an `async` block it doesn't
+  await) ends when the call into the part returns.
+- It can never end the process or reach the host's environment: `exit()`, `env`, `env_vars`, `set_env`, and
+  `remove_env` fail even with `Std` in `libs` (an `exit()` would end the code that called it too, past its
+  try/catch). Its `parse` is always the `untrusted` profile (declarations only, no imports), and can't parse `bstf`
+  or `pkg` (a whole graph adds its types to the document; a package unpacks to disk).
+- What it isn't allowed to make isn't made: a refused `new {}` (fields frozen, or a new root) leaves nothing behind.
+- A scan of the whole document (`funcs(attributes = ..)`, a host running functions by attribute) doesn't find its
+  functions, so it can't make itself a handler that code outside it calls.
+- Objects from elsewhere stay opaque even when handed to it (argument or field): it can hold and return them, not
+  look inside. Pass values (strings, numbers, lists, maps), or list the objects in `reads`.
+- Its only way to anything else is through its gates (`calls`, below).
+- `[]` means nothing: `reads = []` (only itself), `hosts = []` (no network), `libs = []` (no library calls).
+- The rest of the document (and every host call) is unconfined, including after a confined call returns or fails.
+
+**Removable:** `seal(obj, removable = true)` / `{ removable: true }`: it can still be dropped whole (`drop(obj)`,
+`doc.remove(path)`), but not changed, moved, or renamed. Not when another seal covers it. For code that comes and
+goes (a plugin turned on, a tool for one task).
+
+**Inspect:** `sealed(obj)` (Stof map) / `doc.sealed(path)` (JS object, Python dict) / `graph.seal_info(node)`: null
+when not sealed, else `part` (path of the object sealed: this one or one around it), `fields`, `removable`,
+`confined` (list of `{ reads, hosts, libs, time, calls }`; `time` in ms, `calls` as function paths).
+
+**Gates** (`calls`): functions outside the part that its code may call, and that run unconfined, as themselves: an
+API you give it (Ex. one that signs a request with a key the part never sees, or reads one record it may have).
+- Hand them in as values, since a path to them finds nothing from inside: a field in the part holding the function,
+  set before sealing and made `on` the part (`tool.api = new { request: self.link.request } on tool`), or an
+  argument. Then seal once with everything: `seal(tool, reads = [], libs = ['Str'], calls = [self.link.request])`
+  (host: `{ calls: ['link.request'] }`, function paths). A call is a gate's only when every confinement it's called
+  under lists it, so a part can't make one of its own, and confining again only narrows.
+- A gate must be outside the part (one inside would run the part's code unconfined), and is kept as that function,
+  not its path: a function put at the same path later isn't a gate.
+- A gate runs with everything the document has, so it's a door: check what it's given, and hand back values.
+  Objects it hands back stay opaque to the part. Code it calls back in a confined part (Ex. a function value the
+  part passed it) runs confined again, and the part is confined again when the gate returns or fails.
+
+**Untrusted source:** parse code you didn't write with the `untrusted` profile (`parse(src, obj, 'stof',
+'untrusted')`, `doc.parse(src, 'stof', node, 'untrusted')`): declarations only. Nothing runs while it's parsed (field
+and attribute values must be literals; no `#[init]`, and no `#[dropped]`, which would run when the host removes it),
+it imports nothing, and it declares no `#[type]`s (types are found by name across the document), roots, or binary
+data (`data |..|`). Otherwise parsing runs expressions (`leak: root.secrets.key`) before any seal is
+on. Parse into a fresh object (drop it if the parse fails), then seal it confined before calling it.
+
+A typical plugin, end to end:
+```typescript
+doc.parse(pluginSource, 'stof', 'plugins.weather', 'untrusted');  // code you didn't write: declarations only
+doc.parse('api: { quota: root.app.quota_for_plugin }', 'stof', 'plugins.weather'); // its gate (your function)
+doc.seal('plugins.weather', { reads: ['inputs'], hosts: ['api.weather.example'], libs: ['Std', 'Str', 'Http'], time: 2000, calls: ['app.quota_for_plugin'], removable: true });
+await doc.call('plugins.weather.forecast');                       // sees itself + inputs; fetches one host
+doc.remove('plugins.weather');                                    // when it's turned off
+```
+
+## Standard library reference
+
+Read `references/libs/<file>` for full signatures and examples.
+
+| Library | File | For |
+|---|---|---|
+| Std | `Std.md` | Called bare: `pln`, `assert*`, `throw`, `parse`, `stringify`, `blobify`, `copy`, `drop`, `swap`, `funcs`, `sleep`, `env`, `format`, `nanoid`, `min`/`max`, `seal`/`digest`/`sealed` |
+| Obj | `Obj.md` | Objects: `fields`, `insert`, `get`, `set`/`unset` (by name, not path), `contains`, `parent`, `children`, `schemafy`, `instance_of`, `run`, `to_map`, `move`, `attributes`/`set_attribute`/`remove_attribute` |
+| Str | `Str.md` | Strings: `len`, `split`, `lower`, `upper`, `trim`, `replace`, `contains`, `starts_with`, `substring`; by character (not byte): `char_len`, `chars`, `char_at`, `char_index_of`, `char_substring` |
+| Num | `Num.md` | Numbers and units: `abs`, `round`, `floor`, `sqrt`, `pow`, `min`, `max`, `to_units`, `has_units` |
+| List, Map, Set, Tup | `List.md` `Map.md` `Set.md` `Tup.md` | Collections (lists: `map`, `filter`, `any`, `sort_by`, ...) |
+| Fn | `Fn.md` | Functions as values: `call`, `params`, `attributes`/`set_attribute`/`remove_attribute`, `obj`, `bind` |
+| Time | `Time.md` | `Time::now()`, RFC-3339/2822, date math |
+| Ver | `Ver.md` | Semantic versions |
+| Blob | `Blob.md` | Binary data |
+| Data | `Data.md` | Opaque data components (PDFs, images, custom host data) |
+| Prompt | `Prompt.md` | Prompt trees for AI workflows |
+| Md | `Md.md` | Markdown to HTML |
+| Http | `Http.md` | HTTP fetch (`http` feature) |
+| fs | `fs.md` | File system (`system` feature; hosts can remove it) |
+| Key | `Key.md` | Keys and signatures: `generate`, `public`, `sign`, `verify` (see Trust) |
+| Age | `Age.md` | Encryption to a recipient or passphrase (`age_encrypt` feature; in the JS build) |
+| Image, Pdf | `Image.md` `Pdf.md` | Images, PDFs (features) |
