@@ -14,9 +14,7 @@ Check in at the gym. Do squats in front of your webcam. Earn reps. Spend them to
 
 ## Demo
 
-<!-- REPLACE with your video URL after uploading to a GitHub issue -->
-<!-- Drag demo.mov into any GitHub issue comment, copy the generated URL, paste here -->
-https://github.com/user-attachments/assets/PASTE-VIDEO-URL-HERE
+[![VibeRep Demo](https://img.youtube.com/vi/VZWasvN4tio/maxresdefault.jpg)](https://youtu.be/VZWasvN4tio)
 
 ![VibeRep in action — squatting for code](assets/demo_photo.png)
 
