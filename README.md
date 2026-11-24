@@ -14,9 +14,7 @@ Check in at the gym. Do squats in front of your webcam. Earn reps. Spend them to
 
 ## Demo
 
-[![VibeRep Demo](https://img.youtube.com/vi/VZWasvN4tio/maxresdefault.jpg)](https://youtu.be/VZWasvN4tio)
-
-![VibeRep in action — squatting for code](assets/demo_photo.png)
+[![Watch the demo](assets/demo_photo.png)](https://youtu.be/VZWasvN4tio)
 
 ---
 
