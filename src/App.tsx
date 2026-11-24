@@ -123,6 +123,7 @@ export default function App() {
   const rafRef = useRef(0);
   const videoReadyRef = useRef(false);
   const lastAngleTs = useRef(0);
+  const isBuildingRef = useRef(false);
 
   // ---- component helpers ----
   function setCoach(text: string, red = false) {
@@ -392,39 +393,42 @@ export default function App() {
 
   // ---- Build ----
   async function handleBuild() {
-    if (!import.meta.env.VITE_ANTHROPIC_API_KEY) {
-      setCoach('Add your Anthropic API key to .env.local', true);
-      return;
-    }
-
-    if (!checkedInRef.current) {
-      setCoach('Check in first!');
-      return;
-    }
-
-    const result = await checkTier('prompt_quick', BUILD_COST);
-    if (!result.allowed) {
-      const deficit = BUILD_COST - (result.remaining ?? 0);
-      setCoach(
-        `Drop and give me ${deficit} squats, then we'll build.`,
-        true,
-      );
-      return;
-    }
-
-    if (!prompt.trim()) {
-      setCoach('Type what you want to build first!');
-      return;
-    }
-
-    setStep(3);
-    setIsBuilding(true);
-    setStreamingCode('');
-    setRightTab('code');
-    setCoachLine('Building\u2026');
-    setCoachRed(false);
+    if (isBuildingRef.current) return;
+    isBuildingRef.current = true;
 
     try {
+      if (!import.meta.env.VITE_ANTHROPIC_API_KEY) {
+        setCoach('Add your Anthropic API key to .env.local', true);
+        return;
+      }
+
+      if (!checkedInRef.current) {
+        setCoach('Check in first!');
+        return;
+      }
+
+      const result = await checkTier('prompt_quick', BUILD_COST);
+      if (!result.allowed) {
+        const deficit = BUILD_COST - (result.remaining ?? 0);
+        setCoach(
+          `Drop and give me ${deficit} squats, then we'll build.`,
+          true,
+        );
+        return;
+      }
+
+      if (!prompt.trim()) {
+        setCoach('Type what you want to build first!');
+        return;
+      }
+
+      setStep(3);
+      setIsBuilding(true);
+      setStreamingCode('');
+      setRightTab('code');
+      setCoachLine('Building\u2026');
+      setCoachRed(false);
+
       const resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -449,6 +453,10 @@ export default function App() {
           ],
         }),
       });
+
+      if (!resp.ok) {
+        throw new Error(`API returned ${resp.status}`);
+      }
 
       let fullText = '';
       let inTok = 0;
@@ -518,6 +526,7 @@ export default function App() {
       setCoach('API error \u2014 check your key and try again', true);
     } finally {
       setIsBuilding(false);
+      isBuildingRef.current = false;
     }
   }
 

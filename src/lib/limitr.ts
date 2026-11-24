@@ -1,6 +1,6 @@
 import { Limitr } from '@formata/limitr';
 
-const POLICY = `
+export const POLICY = `
 policy:
   credits:
     rep:
