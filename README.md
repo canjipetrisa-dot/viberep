@@ -26,7 +26,7 @@ Check in at the gym. Do squats in front of your webcam. Earn reps. Spend them to
 3. Build        5 squats = 1 prompt to Claude, which writes you a full web app
 ```
 
-The app uses [Limitr](https://github.com/nickhershkowitz/limitr) for billing — except the currency is physical exercise. Your balance goes up when your knees go down.
+The app uses [Limitr](https://www.npmjs.com/package/@formata/limitr) for billing — except the currency is physical exercise. Your balance goes up when your knees go down.
 
 Spacebar adds a rep from anywhere in the app (unless you're typing a prompt, obviously). The +1 REP button in the corner is for people who don't believe in keyboard shortcuts.
 
@@ -58,8 +58,8 @@ The E2E suite covers double-click race conditions, rep spam, camera denial, API 
 
 - **React 19** + **Vite** — the app
 - **MediaPipe Pose** — squat detection via webcam
-- **Claude claude-sonnet-5-5** — builds the web app from your prompt
-- **Limitr** — rate limiting engine (credits = squats)
+- **Claude Sonnet** — builds the web app from your prompt
+- **[Limitr](https://www.npmjs.com/package/@formata/limitr)** — rate limiting engine (credits = squats)
 - **Vitest** + **Playwright** — tests
 
 ## Philosophy
